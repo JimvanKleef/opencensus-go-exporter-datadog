@@ -8,6 +8,7 @@ package datadog
 import (
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -102,6 +103,7 @@ func TestSubmitMetricError(t *testing.T) {
 		t.Errorf("Expected an error")
 	}
 }
+
 func TestDistributionData(t *testing.T) {
 	conn, err := listenUDP("localhost:0")
 	if err != nil {
@@ -116,31 +118,37 @@ func TestDistributionData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data := &view.Data{
-		View: newView(view.Count()),
-		Rows: []*view.Row{
-			{
-				Tags: []tag.Tag{},
-				Data: &view.DistributionData{
-					CountPerBucket:  []int64{0, 2, 3},
-					Min:             1,
-					Max:             5,
-					Mean:            3,
-					SumOfSquaredDev: 10,
-					Count:           15,
-				},
-			},
-		},
-	}
-
 	testCases := map[string]struct {
 		Options         Options
+		Bounds          []float64
 		ExpectedResults []string
 	}{
 		"ok": {
 			Options{
-				StatsAddr: addr,
+				StatsAddr:            addr,
+				HistogramPercentiles: []string{"0.5", "0.95", "0.99"},
 			},
+			[]float64{1, 2, 5},
+			[]string{
+				`fooCount.50percentile:2.000000|g`,
+				`fooCount.95percentile:5.000000|g`,
+				`fooCount.99percentile:5.000000|g`,
+				`fooCount.avg:3.000000|g`,
+				`fooCount.count:15.000000|g`,
+				`fooCount.count_per_bucket:0.000000|g|#bucket_idx:0`,
+				`fooCount.count_per_bucket:2.000000|g|#bucket_idx:1`,
+				`fooCount.count_per_bucket:3.000000|g|#bucket_idx:2`,
+				`fooCount.max:5.000000|g`,
+				`fooCount.min:1.000000|g`,
+				`fooCount.squared_dev_sum:10.000000|g`,
+			},
+		},
+		"empty bounds": {
+			Options{
+				StatsAddr:            addr,
+				HistogramPercentiles: []string{"0.5", "0.95", "0.99"},
+			},
+			[]float64{},
 			[]string{
 				`fooCount.avg:3|g`,
 				`fooCount.count:15|g`,
@@ -157,6 +165,7 @@ func TestDistributionData(t *testing.T) {
 				StatsAddr:              addr,
 				DisableCountPerBuckets: true,
 			},
+			[]float64{1, 2, 5},
 			[]string{
 				`fooCount.avg:3|g`,
 				`fooCount.count:15|g`,
@@ -169,6 +178,22 @@ func TestDistributionData(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			data := &view.Data{
+				View: newView(view.Distribution(tc.Bounds...)),
+				Rows: []*view.Row{
+					{
+						Tags: []tag.Tag{},
+						Data: &view.DistributionData{
+							CountPerBucket:  []int64{0, 2, 3},
+							Min:             1,
+							Max:             5,
+							Mean:            3,
+							SumOfSquaredDev: 10,
+							Count:           15,
+						},
+					},
+				},
+			}
 			exporter, err := testExporter(tc.Options)
 			if err != nil {
 				t.Fatal(err)
@@ -231,5 +256,185 @@ func TestOnError(t *testing.T) {
 
 	if expected == nil {
 		t.Errorf("Expected an error")
+	}
+}
+func TestPercentileName(t *testing.T) {
+	testCases := []struct {
+		Percentile float64
+		Expected   string
+	}{
+		{
+			0.5,
+			"50percentile",
+		},
+		{
+			0.75,
+			"75percentile",
+		},
+		{
+			0.92,
+			"92percentile",
+		},
+		{
+			0.95,
+			"95percentile",
+		},
+		{
+			0.99,
+			"99percentile",
+		},
+		{
+			0.995,
+			"995percentile",
+		},
+		{
+			0.999,
+			"999percentile",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%f", tc.Percentile), func(t *testing.T) {
+			got := percentileName(tc.Percentile)
+			if got != tc.Expected {
+				t.Errorf("Expected: %v, Got %v\n", tc.Expected, got)
+			}
+		})
+	}
+}
+
+func TestCalculatePercentile(t *testing.T) {
+	var buckets []float64
+	for i := 0.01; i < 100; i += 0.01 {
+		buckets = append(buckets, i)
+	}
+
+	var countsPerBucket []int64
+	for i := int64(0); i <= int64(len(buckets)); i += 1 {
+		countsPerBucket = append(countsPerBucket, 10)
+	}
+
+	testCases := []struct {
+		expected        float64
+		percentile      float64
+		buckets         []float64
+		countsPerBucket []int64
+	}{
+		{
+			0,
+			0,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			10,
+			0.1,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			50,
+			0.5,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			70,
+			0.70,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			81,
+			0.81,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			100,
+			1.0,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			99,
+			0.99,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			99.9,
+			0.999,
+			buckets,
+			countsPerBucket,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%v", tc.percentile), func(t *testing.T) {
+			got := calculatePercentile(tc.percentile, tc.buckets, tc.countsPerBucket)
+
+			if math.Abs(tc.expected-got) > 0.01 {
+				t.Errorf("Expected: %v to be within 0.1 of %v", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestCalculatePercentileTwoPower(t *testing.T) {
+	buckets := []float64{1, 2, 4, 8, 16, 32, 64, 128, 256}
+	countsPerBucket := []int64{10, 30, 60, 100, 20, 50, 100, 20, 9, 1}
+	testCases := []struct {
+		expected        float64
+		percentile      float64
+		buckets         []float64
+		countsPerBucket []int64
+	}{
+		{
+			8,
+			0.5,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			32,
+			0.6,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			64,
+			0.9,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			64,
+			0.9,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			128,
+			0.95,
+			buckets,
+			countsPerBucket,
+		},
+		{
+			256,
+			1,
+			buckets,
+			countsPerBucket,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%v", tc.percentile), func(t *testing.T) {
+			got := calculatePercentile(tc.percentile, tc.buckets, tc.countsPerBucket)
+
+			if tc.expected != got {
+				t.Errorf("Expected: %v to be %v", tc.expected, got)
+			}
+		})
 	}
 }
